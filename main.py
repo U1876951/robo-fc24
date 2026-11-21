@@ -1,120 +1,287 @@
-from flask import Flask
-import threading
 import os
-import telebot
+import time
 import math
 import random
+import logging
+import threading
 from collections import Counter
 
-app = Flask('')
+from flask import Flask
+import telebot
 
-@app.route('/')
-def home():
-    return "Robô online!"
+# CONFIGURAÇÃO
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-def run():
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 
-threading.Thread(target=run).start()
+if not TOKEN:
+    raise RuntimeError(
+        "Falta configurar TELEGRAM_BOT_TOKEN no Render."
+    )
 
-# ⚠️ COLOQUE O SEU NOVO TOKEN AQUI ⚠️
-TOKEN = "9114122727:AAFdZY2ESyDfHD1njhkWjRCg26jPV9Eoy8M" 
+app = Flask(__name__)
 bot = telebot.TeleBot(TOKEN)
 
 N_SIMULACOES = 20000
 
-def calcular_probabilidades_implicitas(odds):
-    brutas = {k: 1.0 / v for k, v in odds.items() if v > 1.0}
-    total = sum(brutas.values())
-    justas = {k: p / total for k, p in brutas.items()}
-    return justas, total - 1.0
 
-def simular(lam_h, lam_a):
-    over = 0
+@app.route("/")
+def home():
+    return "Robô FC 24 online! 🤖⚽", 200
+
+
+def calcular_probabilidades_implicitas(odds):
+    if any(odd <= 1.0 for odd in odds.values()):
+        raise ValueError("As odds devem ser superiores a 1.00.")
+
+    brutas = {k: 1.0 / v for k, v in odds.items()}
+    total = sum(brutas.values())
+
+    justas = {
+        k: valor / total
+        for k, valor in brutas.items()
+    }
+
+    margem = (total - 1.0) * 100
+    return justas, margem
+
+
+def sortear_poisson(lam):
+    limite = math.exp(-lam)
+    produto = 1.0
+    golos = 0
+
+    while produto > limite:
+        produto *= random.random()
+        if produto > limite:
+            golos += 1
+
+    return golos
+
+
+def simular(lam_casa, lam_fora):
     placares = Counter()
+    over = 0
+
     for _ in range(N_SIMULACOES):
-        gh, ga = 0, 0
-        L_h, L_a = math.exp(-lam_h), math.exp(-lam_a)
-        p_h, p_a = 1.0, 1.0
-        
-        while True:
-            p_h *= random.random()
-            if p_h <= L_h: break
-            gh += 1
-            
-        while True:
-            p_a *= random.random()
-            if p_a <= L_a: break
-            ga += 1
-            
-        placares[(gh, ga)] += 1
-        if gh + ga > 14.5: over += 1
+        casa = sortear_poisson(lam_casa)
+        fora = sortear_poisson(lam_fora)
+
+        placares[(casa, fora)] += 1
+
+        if casa + fora >= 15:
+            over += 1
+
     return placares, over / N_SIMULACOES
 
-@bot.message_handler(commands=['start', 'help'])
+
+@bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
+
     texto = (
         "🤖 *Olá! Sou o Robô FC 24.*\n\n"
-        "Envie os dados separados por vírgula:\n"
-        "`Casa, Visitante, OddCasa, OddEmpate, OddFora, OddOver, OddUnder`\n\n"
+        "Envie os dados separados por vírgulas:\n\n"
+        "`Casa, Visitante, OddCasa, OddEmpate, "
+        "OddFora, OddOver, OddUnder`\n\n"
         "Exemplo:\n"
-        "`Aston Villa, Fulham, 1.445, 9.57, 3.43, 2.025, 1.825`"
+        "`Aston Villa, Fulham, 1.445, 4.57, "
+        "3.43, 2.025, 1.825`\n\n"
+        "⚽ Estou pronto para analisar!"
     )
-    bot.reply_to(message, texto, parse_mode='Markdown')
 
-@bot.message_handler(func=lambda message: True)
+    bot.reply_to(message, texto, parse_mode="Markdown")
+
+
+@bot.message_handler(func=lambda message: bool(message.text))
 def processar(message):
+
     try:
-        partes = message.text.replace(" ", "").split(",")
+        partes = [
+            parte.strip()
+            for parte in message.text.split(",")
+        ]
+
         if len(partes) != 7:
-            bot.reply_to(message, "❌ Erro: Envie 7 dados separados por vírgula. Ex: TimeA, TimeB, 1.5, 4.0, 3.0, 1.9, 1.9")
+            bot.reply_to(
+                message,
+                "❌ Envie exatamente 7 dados separados por vírgulas."
+            )
             return
 
-        time_h, time_a = partes[0], partes[1]
-        odd_h, odd_d, odd_a = float(partes[2]), float(partes[3]), float(partes[4])
-        odd_over, odd_under = float(partes[5]), float(partes[6])
+        time_casa = partes[0]
+        time_fora = partes[1]
 
-        bot.reply_to(message, "⏳ Simulando 20.000 jogos...")
+        if not time_casa or not time_fora:
+            raise ValueError("Indique os nomes das equipas.")
 
-        justas, _ = calcular_probabilidades_implicitas({"home": odd_h, "draw": odd_d, "away": odd_a})
-        
-        p_empate = justas.get("draw", 0.25)
-        lam_total = 14.0 + ((0.30 - p_empate) * 2.0)
-        forca_h = justas["home"] + 0.5 * justas["draw"]
-        forca_a = justas["away"] + 0.5 * justas["draw"]
-        lam_h = lam_total * (forca_h / (forca_h + forca_a))
-        lam_a = lam_total * (forca_a / (forca_h + forca_a))
+        odd_casa, odd_empate, odd_fora, odd_over, odd_under = (
+            map(float, partes[2:])
+        )
 
-        placares, p_over = simular(lam_h, lam_a)
+        odds = {
+            "home": odd_casa,
+            "draw": odd_empate,
+            "away": odd_fora
+        }
+
+        justas, margem = calcular_probabilidades_implicitas(odds)
+
+        if odd_over <= 1 or odd_under <= 1:
+            raise ValueError("Odds Over/Under inválidas.")
+
+        bot.reply_to(
+            message,
+            "⏳ A simular 20.000 jogos..."
+        )
+
+        # MODELO DE SIMULAÇÃO
+
+        p_empate = justas["draw"]
+
+        lam_total = 14.0 + (
+            (0.30 - p_empate) * 2.0
+        )
+
+        lam_total = max(8.0, min(20.0, lam_total))
+
+        forca_casa = (
+            justas["home"] + 0.5 * justas["draw"]
+        )
+
+        forca_fora = (
+            justas["away"] + 0.5 * justas["draw"]
+        )
+
+        soma = forca_casa + forca_fora
+
+        lam_casa = lam_total * forca_casa / soma
+        lam_fora = lam_total * forca_fora / soma
+
+        placares, p_over = simular(
+            lam_casa,
+            lam_fora
+        )
+
         p_under = 1 - p_over
-        
-        ev_over = (p_over * odd_over - 1) * 100
-        ev_under = (p_under * odd_under - 1) * 100
 
-        top3 = sorted(placares.items(), key=lambda x: -x[1])[:3]
-        res_placares = "".join([f"   {sh}-{sa} ({c/N_SIMULACOES*100:.1f}%)\n" for (sh, sa), c in top3])
+        ev_over = (
+            p_over * odd_over - 1
+        ) * 100
+
+        ev_under = (
+            p_under * odd_under - 1
+        ) * 100
+
+        top3 = sorted(
+            placares.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:3]
+
+        res_placares = ""
+
+        for (casa, fora), quantidade in top3:
+
+            percentagem = (
+                quantidade / N_SIMULACOES
+            ) * 100
+
+            res_placares += (
+                f"   {casa}-{fora} "
+                f"({percentagem:.1f}%)\n"
+            )
 
         resposta = (
-            f"⚽ *{time_h} vs {time_a}*\n\n"
-            f"🎯 *Probabilidades 1X2:*\n"
-            f"   Casa: {justas['home']*100:.1f}%\n"
-            f"   Empate: {justas['draw']*100:.1f}%\n"
-            f"   Fora: {justas['away']*100:.1f}%\n\n"
-            f"📈 *Gols Esperados (λ):*\n"
-            f"   {time_h}: {lam_h:.2f}\n"
-            f"   {time_a}: {lam_a:.2f}\n"
-            f"   Total: {lam_total:.2f}\n\n"
-            f"🏆 *Top 3 Placares:*\n{res_placares}\n"
-            f"🎲 *Over/Under 14.5:*\n"
-            f"   P(Over): {p_over*100:.1f}%\n"
-            f"   P(Under): {p_under*100:.1f}%\n\n"
-            f"💡 *Value Bet:*\n"
-            f"   OVER EV: {ev_over:+.1f}%\n"
-            f"   UNDER EV: {ev_under:+.1f}%"
-        )
-        bot.reply_to(message, resposta, parse_mode='Markdown')
-    except Exception as e:
-        bot.reply_to(message, "❌ Erro nos dados. Verifique as vírgulas e os números.")
+            f"⚽ *{time_casa} vs {time_fora}*\n\n"
 
-print("Bot online! Aguardando mensagens...")
-bot.infinity_polling()
+            f"🎯 *PROBABILIDADES 1X2*\n"
+            f"Casa: {justas['home']*100:.1f}%\n"
+            f"Empate: {justas['draw']*100:.1f}%\n"
+            f"Fora: {justas['away']*100:.1f}%\n"
+            f"Margem das odds: {margem:.1f}%\n\n"
+
+            f"📈 *GOLOS ESPERADOS*\n"
+            f"{time_casa}: {lam_casa:.2f}\n"
+            f"{time_fora}: {lam_fora:.2f}\n"
+            f"Total: {lam_total:.2f}\n\n"
+
+            f"🏆 *TOP 3 PLACARES*\n"
+            f"{res_placares}\n"
+
+            f"🎲 *OVER / UNDER 14.5*\n"
+            f"Over: {p_over*100:.1f}%\n"
+            f"Under: {p_under*100:.1f}%\n\n"
+
+            f"💎 *VALUE BET (+EV)*\n"
+            f"Over EV: {ev_over:+.1f}%\n"
+            f"Under EV: {ev_under:+.1f}%\n\n"
+
+            "ℹ️ Simulação matemática baseada nas odds "
+            "fornecidas. Não utiliza estatísticas reais "
+            "nem dados ao vivo. EV positivo não garante lucro."
+        )
+
+        bot.reply_to(
+            message,
+            resposta,
+            parse_mode="Markdown"
+        )
+
+    except ValueError as erro:
+
+        bot.reply_to(
+            message,
+            f"❌ Dados inválidos: {erro}"
+        )
+
+    except Exception:
+
+        logging.exception("Erro ao processar mensagem")
+
+        bot.reply_to(
+            message,
+            "❌ Ocorreu um erro. Tente novamente."
+        )
+
+
+def iniciar_bot():
+
+    while True:
+
+        try:
+
+            logging.info("A iniciar o Telegram...")
+
+            bot.infinity_polling(
+                skip_pending=True,
+                timeout=20,
+                long_polling_timeout=20
+            )
+
+        except Exception:
+
+            logging.exception(
+                "Erro no Telegram. Nova tentativa em 5 segundos."
+            )
+
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+
+    threading.Thread(
+        target=iniciar_bot,
+        daemon=True
+    ).start()
+
+    porta = int(os.environ.get("PORT", "10000"))
+
+    logging.info("Robô FC 24 a iniciar...")
+
+    app.run(
+        host="0.0.0.0",
+        port=porta
+        )
